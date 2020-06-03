@@ -70,19 +70,8 @@ DATETIME_REGEX = re.compile(
     optional(PERIOD_PATTERN)    +
     WHITESPACE_PATTERN          +
     TZINFO_PATTERN              +
-    "$"
-)
-
-print(
-    "^"                         +
-    DATE_PATTERN                +
-    WHITESPACE_PATTERN          +
-    TIME_PATTERN                +
-    WHITESPACE_PATTERN          +
-    optional(PERIOD_PATTERN)    +
-    WHITESPACE_PATTERN          +
-    TZINFO_PATTERN              +
-    "$"
+    "$",
+    re.I
 )
 
 def time_conversion(string):
@@ -111,6 +100,9 @@ def time_conversion(string):
             hour = time
             minute = 0
 
+        hour = int(hour)
+        minute = int(minute)
+
         if period == "pm":
             hour += 12
 
@@ -127,8 +119,8 @@ def time_conversion(string):
             int(match.group("year")),
             int(match.group("month")),
             int(match.group("day")),
-            int(hour),
-            int(minute),
+            hour,
+            minute,
             tzinfo = timezone(timedelta(hours = int(tzhour), minutes = int(tzminute)))
         )
 
@@ -150,10 +142,12 @@ class PokeCog(commands.Cog):
 
     @poke.command()
     async def add(self, ctx, who: discord.User, datetime: str, message: str, channel: discord.TextChannel):
+        await ctx.send(datetime)
         datetime = time_conversion(datetime)
         await ctx.send("Adding!")
         await who.send(message)
         logchannel = await self.config.guild(ctx.guild).logchannel()
+        logchannel = ctx.bot.get_channel(logchannel)
         if logchannel:
             await logchannel.send('Sending "{}" to "{}" on "{}"'.format(message, who, datetime))
 
@@ -180,4 +174,4 @@ class PokeCog(commands.Cog):
     #designate a channel on the server to log all pokes coming from the server
     @poke.command()
     async def log(self, ctx, channel: discord.TextChannel):
-        await self.config.guild(ctx.guild).logchannel.set(channel)
+        await self.config.guild(ctx.guild).logchannel.set(channel.id)
