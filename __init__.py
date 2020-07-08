@@ -1,4 +1,7 @@
 from .poke import PokeCog
 
 def setup(bot):
-    bot.add_cog(PokeCog())
+    cog = PokeCog()
+    cog.bot = bot
+    bot.loop.create_task(cog.initialize())
+    bot.add_cog(cog)
