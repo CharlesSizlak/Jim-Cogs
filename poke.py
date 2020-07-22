@@ -4,11 +4,13 @@ import hashlib
 import json
 import asyncio
 from calendar import monthrange
-from redbot.core import commands, Config
+from redbot.core import commands, Config, checks
+from redbot.cogs.permissions.converters import GuildUniqueObjectFinder, CogOrCommand, RuleType
 from datetime import datetime, timezone, timedelta
 from typing import Union
 from functools import partial
 
+DONE_REACTIONS = ('\U0001F1E9', '\U0001F1F4', '\U0001F1F3', '\U0001F1EA', '\U0001F44D')
 
 SINGLE = 0
 HOURLY = 1
@@ -36,33 +38,25 @@ def optional(term):
     return r"({})?".format(term)
 
 WHITESPACE_PATTERN = r"\s*"
+YEARS_PATTERN = named_group("years", r"\d+") + WHITESPACE_PATTERN + r"(y|yr|year|yeer)s?"
+WEEKS_PATTERN = named_group("weeks", r"\d+") + WHITESPACE_PATTERN + r"(w|wk|wek|week)s?"
+DAYS_PATTERN = named_group("days", r"\d+") + WHITESPACE_PATTERN + r"(d|da|day)s?"
 HOURS_PATTERN = named_group("hours", r"\d+") + WHITESPACE_PATTERN + r"(h|hr|hour)s?"
 MINUTES_PATTERN = named_group("minutes", r"\d+") + WHITESPACE_PATTERN + r"(m|min|minute)s?"
-#SECONDS_PATTERN = named_group("seconds", r"\d+") + WHITESPACE_PATTERN + r"(s|sec|second)s?"
 
-HOURS_MINUTES_SECONDS_REGEX = re.compile(
+OFFSET_REGEX = re.compile(
     "^"                         +
-    HOURS_PATTERN               +
+    optional(YEARS_PATTERN)     +
+    WHITESPACE_PATTERN          +
+    optional(WEEKS_PATTERN)     +
+    WHITESPACE_PATTERN          +
+    optional(DAYS_PATTERN)      +
+    WHITESPACE_PATTERN          +
+    optional(HOURS_PATTERN)     +
     WHITESPACE_PATTERN          +
     optional(MINUTES_PATTERN)   +
-    #WHITESPACE_PATTERN         +
-    #optional(SECONDS_PATTERN)  +
     "$"
 )
-
-MINUTES_SECONDS_REGEX = re.compile(
-    "^"                         +
-    MINUTES_PATTERN             +
-    #WHITESPACE_PATTERN         +
-    #optional(SECONDS_PATTERN)  +
-    "$"
-)
-
-#SECONDS_REGEX = re.compile(
-#    "^"                         +
-#    SECONDS_PATTERN             +
-#    "$"
-#)
 
 DATE_PATTERN = r"{}/{}/{}".format(
     named_group("month", r"\d{1,2}"),
@@ -125,6 +119,10 @@ class Paginator:
         for message in self.messages:
             await ctx.send("```\n" + message + "\n```")
 
+def ListArgument(string):
+    string = string.replace(",", " ")
+    return string.split()
+
 def recurrence_conversion(string):
     for enum, items in RECURRENCE_OPTIONS.items():
         if string in items:
@@ -132,30 +130,24 @@ def recurrence_conversion(string):
     raise ValueError("Invalid recurrence provided")
 
 async def time_conversion(string, cog, user):
-    match = HOURS_MINUTES_SECONDS_REGEX.search(string)
+    match = OFFSET_REGEX.search(string)
     if match:
+        minutes = 0
+        if match.group('years'):
+            minutes += int(match.group('years')) * 60 * 24 * 365
+        if match.group('weeks'):
+            minutes += int(match.group('weeks')) * 60 * 24 * 7
+        if match.group('days'):
+            minutes += int(match.group('days')) * 60 * 24
+        if match.group('hours'):
+            minutes += int(match.group('hours')) * 60
         if match.group('minutes'):
-            minute = int(match.group('minutes'))
-        else:
-            minute = 0
+            minutes += int(match.group('minutes'))
 
         return datetime.now() + timedelta(
-            hours=int(match.group('hours')),
-            minutes=minute
-            #,seconds=int(match.group('seconds')) 
-            )
+            minutes=minutes
+        )
 
-    match = MINUTES_SECONDS_REGEX.search(string)
-    if match:
-        return datetime.now() + timedelta(
-            minutes=int(match.group('minutes'))
-            #,seconds=int(match.group('seconds')) 
-            )
-
-    #match = SECONDS_REGEX.search(string)
-    #if match:
-        #return datetime.now()
-    
     match = DATETIME_REGEX.search(string)
     if match:
         time = match.group("time")
@@ -196,39 +188,43 @@ async def time_conversion(string, cog, user):
 
     raise ValueError("Invalid datetime provided.")
 
-#TODO test if year and month recurrences work
 async def messenger(cog):
     data = cog.load_pokes()
     current_time = datetime.now().replace(second=0, microsecond=0)
     new_data = {}
     for guild_id, all_pokes_info in data.items():
-        logchannel = await cog.get_logchannel(cog.bot.get_guild(int(guild_id)))
+        guild = cog.bot.get_guild(int(guild_id))
+        if not guild:
+            new_data[guild_id] = 'This server has been deleted.'
+            continue
         added_pokes = []
         new_data[guild_id] = added_pokes
         for timestamp, message, target, channel, recurrence, user_or_role, day_in_month in all_pokes_info:
-            #from the datetime timestamp reconstruct a datetime and figure out whether or not we're in the same minute, and go from there
             poke_time = datetime.fromtimestamp(timestamp)
-            if poke_time == current_time:
-                #go in to the guild id to find the correct guild to send a message in
-                guild = cog.bot.get_guild(int(guild_id))
-                #find the channel
+            if poke_time <= current_time:
                 channel = cog.bot.get_channel(channel)
-                #construct the message using the target and the message
                 if user_or_role == USER:
                     target = cog.bot.get_user(target)
                 else:
                     target = guild.get_role(target)
-                if target is None:
+                if not target:
                     recurrence = SINGLE
-                    if logchannel:
-                        await logchannel.send('Jim_Bot tried to send "{}" to a user or role that no longer exists. If this message was set to happen again, you will need to make a new poke mentioning an existing role or user'.format(message))
-                if channel:
+                    await cog.send_to_log(guild, 'Jim_Bot tried to send "{}" to a user or role that no longer exists. If this message was set to happen again, you will need to make a new poke mentioning an existing role or user'.format(message))
+                    continue
+                if not channel:
+                    recurrence = SINGLE
+                    await cog.send_to_log(guild, 'Jim_Bot tried to send "{}" to "{}" in a channel that has since been deleted. If this message was set to happen again, you will need to make a new poke for an existing channel.'.format(message, target))
+                    continue
+                try:
                     await channel.send("{} {}".format(target.mention, message))
-                else:
+                except discord.errors.Forbidden:
+                    await cog.send_to_log(guild, 'Jim_Bot tried to send "{}" to "{}" in "{}" but does not have access to that channel. If this message was set to happen again, you will need to make a new poke for a channel Jim_Bot has permissions to send messages in.'.format(message, target, channel))
                     recurrence = SINGLE
-                    if logchannel:
-                        await logchannel.send('Jim_Bot tried to send "{}" to "{}" in a channel that has since been deleted. If this message was set to happen again, you will need to make a new poke for an existing channel.'.format(message, target))
-                #check recurrence
+                if poke_time > current_time:
+                    try:
+                        await channel.send("This message was originally supposed to be sent at {} but could not be sent due to an issue connecting to discord's servers at that time.".format(poke_time))
+                    except discord.errors.Forbidden:
+                        pass
                 if recurrence == HOURLY:
                     poke_time = poke_time + timedelta(hours=1)
                 elif recurrence == DAILY:
@@ -246,6 +242,7 @@ async def messenger(cog):
                         new_day = day_in_month
                     poke_time = poke_time.replace(month = next_month, day = new_day)
                 elif recurrence == YEARLY:
+                    year = poke_time.year
                     if poke_time.month == 2 and day_in_month == 29:
                         _, leap_check = monthrange(year + 1, month)
                         if leap_check == 29:
@@ -271,12 +268,7 @@ async def connection_handler(cog, reader, writer):
     GO_MESSAGE = b"go for pokes"
     if await reader.readexactly(len(GO_MESSAGE)) == GO_MESSAGE:
         await messenger(cog)
-        
-#TODO double check that all commands with pokecog work correctly across multiple servers
-#TODO see if we can accept capital letters in commands from the user, instead of just lowercase
-#TODO make it so you can not have a log channel anymore after setting a logchannel
-#TODO what happens if a user is deleted and a message is meant to be sent to them
-#TODO break the bots connection with discord to see what happens
+
 class PokeCog(commands.Cog):
     def __init__(self):
         self.config = Config.get_conf(self, identifier=hashlib.sha512(b'PokeCog').hexdigest())
@@ -287,6 +279,15 @@ class PokeCog(commands.Cog):
             user_tz = -4
         )
         self.server = None
+        self._permissions_cog = None
+
+
+    @property
+    def permissions_cog(self):
+        if self._permissions_cog is None:
+            self._permissions_cog = self.bot.get_cog("Permissions")
+        return self._permissions_cog
+
 
     async def initialize(self):
         self.server = await asyncio.start_server(
@@ -306,10 +307,18 @@ class PokeCog(commands.Cog):
         await self.config.user(user).user_tz.set((hours, minutes))
 
     async def get_logchannel(self, guild):
-        logchannel = await self.config.guild(guild).logchannel()
-        logchannel = self.bot.get_channel(logchannel)
+        logchannel_id = await self.config.guild(guild).logchannel()
+        logchannel = self.bot.get_channel(logchannel_id)
         return logchannel
     
+    async def send_to_log(self, guild, message):
+        logchannel = await self.get_logchannel(guild)
+        if logchannel:
+            try:
+                await logchannel.send(message)
+            except discord.errors.Forbidden:
+                pass
+
     def save_pokes(self, data):
         with open('/home/sizlak/jim_cogs/poke/data.json', 'w') as f:
             f.write(json.dumps(data))
@@ -327,13 +336,38 @@ class PokeCog(commands.Cog):
         if serverid in data:
             return
         data[serverid] = []
-        save_pokes(data)
-
+        self.save_pokes(data)
+    
+    async def reaction_manager(self, message, reactions_list):
+        try:
+            for reaction in reactions_list:
+                await message.add_reaction(reaction)
+        except discord.errors.Forbidden:
+            await self.send_to_log(message.guild, 'Jim_Bot tried to add reactions in channel "{}" but does not have permission.'.format(message.channel))
+            
     @commands.group()
     async def poke(self, ctx):
         pass
 
+    @checks.guildowner()
     @poke.command()
+    async def permissions_control(self, ctx, who: GuildUniqueObjectFinder,
+            commands: ListArgument, allow_or_deny: RuleType):
+        for command in commands:
+            cog_or_command = await CogOrCommand.convert(ctx,"poke " + command)
+            await self.permissions_cog._add_rule(
+                rule=allow_or_deny,
+                cog_or_cmd=cog_or_command,
+                model_id=who.id,
+                guild_id=ctx.guild.id
+            )
+            await self.send_to_log(ctx.guild, 'Changed permissions for command "{}" for "{}" to "{}"'.format(
+                command, who, "Allow" if allow_or_deny else "Deny"
+            ))
+        await self.reaction_manager(ctx.message, DONE_REACTIONS)
+
+
+    @poke.command(aliases=["Set_My_Tz", "set_my_TZ", "SET_MY_TZ", "Set_my_tz", "Set_my_TZ"])
     async def set_my_tz(self, ctx, tz_offset: str):
         tz_offset = tz_offset.lower()
         try:
@@ -345,12 +379,11 @@ class PokeCog(commands.Cog):
             hours = int(tzhour)
             minutes = int(tzminute)
             await self.set_user_tz(ctx.author, hours, minutes)
-            for reaction in ('\U0001F1E9', '\U0001F1F4', '\U0001F1F3', '\U0001F1EA', '\U0001F44D'):
-                await ctx.message.add_reaction(reaction)
+            await self.reaction_manager(ctx.message, DONE_REACTIONS)
         except ValueError:
             await ctx.send("Hey that doesn't look like a viable UTC offset")
 
-    @poke.command()
+    @poke.command(aliases=["Delete", "DELETE"])
     async def delete(self, ctx, targets):
         data = self.load_pokes()
         deleted_pokes = []
@@ -369,58 +402,65 @@ class PokeCog(commands.Cog):
             message += ", "
         message = message[:-2]
         await ctx.send("Pokes {} have been deleted.".format(message))
-        logchannel = await self.get_logchannel(ctx.guild)
-        if logchannel:
-            await logchannel.send("User {} has deleted pokes {}".format(ctx.author, message))
+        await self.send_to_log(ctx.guild, "User {} has deleted pokes {}".format(ctx.author, message))
 
-    # TODO When there are no pokes associated with the guild it doesn't send a nice looking message
-    @poke.command()
+    @poke.command(aliases=["List", "LIST"])
     async def list(self, ctx):
         data = self.load_pokes()
-        paginator = Paginator()
         pokes = data[str(ctx.guild.id)]
-        i = 0
-        for timestamp, message, target, channel, recurrence, user_or_role, day_in_month in pokes:
-            i += 1
-            paginator.add_line(
-                "{}: {} at {} we are going to message '{}' in '{}', the following\n\"{}\"".format(
-                    i,
-                    RECURRENCES[recurrence],
-                    datetime.fromtimestamp(timestamp).astimezone().strftime(
-                        "%Y-%m-%d %H:%M %z"
-                    ),
-                    ctx.bot.get_user(target) if user_or_role == USER else ctx.guild.get_role(target),
-                    ctx.bot.get_channel(channel),
-                    message
+        if pokes == []:
+            await ctx.send("It doesn't look like there are any pokes for this server at this time.")
+        else:
+            paginator = Paginator()
+            i = 0
+            for timestamp, message, target, channel, recurrence, user_or_role, day_in_month in pokes:
+                i += 1
+                message = message.replace("`", "\u200b`\u200b")
+                target = ctx.bot.get_user(target) if user_or_role == USER else ctx.guild.get_role(target)
+                if not target:
+                    target = "DELETED USER OR ROLE, MESSAGE WILL FAIL"
+                paginator.add_line(
+                    "{}: {} at {} we are going to message '{}' in '{}', the following\n\"{}\"".format(
+                        i,
+                        RECURRENCES[recurrence],
+                        datetime.fromtimestamp(timestamp).astimezone().strftime(
+                            "%Y-%m-%d %H:%M %z"
+                        ),
+                        target,
+                        ctx.bot.get_channel(channel),
+                        message
+                    )
                 )
-            )
-        await paginator.send(ctx)
-        logchannel = await self.get_logchannel(ctx.guild)
-        if logchannel:
-            await logchannel.send("User {} has asked for a snapshot of all current pokes".format(ctx.author))
+            await paginator.send(ctx)
+            await self.send_to_log(ctx.guild, "User {} has asked for a snapshot of all current pokes".format(ctx.author))
            
-    @poke.command()
+    @poke.command(aliases=["Armageddon", "ARMAGEDDON", "A R M A G E D D O N"])
     async def armageddon(self, ctx):
         data = self.load_pokes()
         data[str(ctx.guild.id)] = []
         self.save_pokes(data)
         await ctx.send("Deleting all pokes!")
-        await ctx.message.add_reaction('\U0001F4A5')
-        logchannel = await self.get_logchannel(ctx.guild)
-        if logchannel:
-            await logchannel.send("User {} has deleted all pokes!".format(ctx.author))
+        await self.reaction_manager(ctx.message, ['\U0001F4A5'])
+        await self.send_to_log(ctx.guild, "User {} has deleted all pokes!".format(ctx.author))
 
-    @poke.command()
-    async def log(self, ctx, channel: discord.TextChannel):
+    @poke.command(aliases=["Set_Logchannel", "SET_LOGCHANNEL", "Set_logchannel"])
+    async def set_logchannel(self, ctx, channel: discord.TextChannel):
         await self.config.guild(ctx.guild).logchannel.set(channel.id)
-        logchannel = await self.get_logchannel(ctx.guild)
-        if logchannel:
-            await logchannel.send("This channel has been set as the log channel for pokes.")
+        await self.send_to_log(ctx.guild, "This channel has been set as the log channel for pokes.")
+        try:
             await ctx.send("Setting log channel!")
-    
+        except discord.errors.Forbidden:
+            self.send_to_log(ctx.guild, "You set the logchannel from a channel that Jim_Bot does not have permissions in.")
 
-    #TODO check if the bot has access to the channel you're trying to send the message in
-    @poke.command()
+    @poke.command(aliases=["Clear_Logchannel", "CLEAR_LOGCHANNEL", "Clear_logchannel"])
+    async def clear_logchannel(self, ctx):
+        await self.config.guild(ctx.guild).logchannel.set(None)
+        try:
+            await ctx.send('User {} has removed the server logchannel'.format(ctx.author))
+        except discord.errors.Forbidden:
+            pass
+
+    @poke.command(aliases=["Add", "ADD"])
     async def add(self, ctx, who: Union[discord.User, discord.Role],
     poke_time: str, message: str, channel: discord.TextChannel, recurrence="single"):
         if len(message) > 1800:
@@ -442,11 +482,8 @@ class PokeCog(commands.Cog):
             recurrence, user_or_role, day_in_month
         ])
         self.save_pokes(data)
-        logchannel = await self.get_logchannel(ctx.guild)
-        if logchannel:
-            await logchannel.send('Sending "{}" to "{}" on "{}"'.format(
+        await self.send_to_log(ctx.guild, 'Sending "{}" to "{}" on "{}"'.format(
                 message, who, 
                 poke_time.astimezone().strftime("%Y-%m-%d %H:%M %z"
             )))
-        for reaction in ('\U0001F1E9', '\U0001F1F4', '\U0001F1F3', '\U0001F1EA', '\U0001F44D'):
-            await ctx.message.add_reaction(reaction)
+        await self.reaction_manager(ctx.message, DONE_REACTIONS)
