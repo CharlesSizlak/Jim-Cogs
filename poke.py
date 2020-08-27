@@ -195,7 +195,7 @@ async def messenger(cog):
     for guild_id, all_pokes_info in data.items():
         guild = cog.bot.get_guild(int(guild_id))
         if not guild:
-            new_data[guild_id] = 'This server has been deleted.'
+            new_data[guild_id] = []
             continue
         added_pokes = []
         new_data[guild_id] = added_pokes
@@ -269,6 +269,10 @@ async def connection_handler(cog, reader, writer):
     if await reader.readexactly(len(GO_MESSAGE)) == GO_MESSAGE:
         await messenger(cog)
 
+#TODO properly close the connections once they're finished
+#TODO technically there's a possibility of a memory issue as we're not clearing out unused servers at this time. while it's unlikely jim is going to be added to a hundred thousand servers and removed from all of them
+#TODO it is possible that it could cause issues
+#TODO update jim_bot to redbot 3.4
 class PokeCog(commands.Cog):
     def __init__(self):
         self.config = Config.get_conf(self, identifier=hashlib.sha512(b'PokeCog').hexdigest())
@@ -385,6 +389,7 @@ class PokeCog(commands.Cog):
 
     @poke.command(aliases=["Delete", "DELETE"])
     async def delete(self, ctx, targets):
+        self.json_checker(ctx.guild.id)
         data = self.load_pokes()
         deleted_pokes = []
         message = ""
@@ -406,6 +411,7 @@ class PokeCog(commands.Cog):
 
     @poke.command(aliases=["List", "LIST"])
     async def list(self, ctx):
+        self.json_checker(ctx.guild.id)
         data = self.load_pokes()
         pokes = data[str(ctx.guild.id)]
         if pokes == []:
